@@ -1,3 +1,5 @@
+#define CODE_VERSION "002"
+
 /* Gateway between CANbus and http over WiFi.
  *   
  * The code is slightly biassed toward the Renault brand in the sense
@@ -115,7 +117,7 @@
 
 // Optional functionality. Comment out defines to disable feature
 #define WIFI_PORTAL                     // Enable WiFi config portal
-//#define ARDUINO_OTA                   // Enable Arduino IDE OTA updates
+#define ARDUINO_OTA                     // Enable Arduino IDE OTA updates
 //#define HTTP_OTA                      // Enable OTA updates from http server
 #define LED_STATUS_FLASH                // Enable flashing LED status
 //#define DEEP_SLEEP_SECONDS   5        // Define for sleep period between process repeats. No sleep if not defined
@@ -147,7 +149,7 @@ WiFiManager wifiManager;
 
 #define ARDUINO_OTA_PORT      8266      // leave untouched
 #define ARDUINO_OTA_HOSTNAME  "esp8266" // leave untouched, used by mDNS
-#define ARDUINO_OTA_PASSWD    "123"
+#define ARDUINO_OTA_PASSWD    "4336"
 #endif
 
 /* Over The Air automatic firmware update from a web server.  ESP8266 will contact the
@@ -163,7 +165,7 @@ WiFiManager wifiManager;
 #define HTTP_OTA_PATH         F("/esp8266-ota/update/update.php") // Path to update firmware
 #define HTTP_OTA_PORT         8123                     // Port of update server
 // Name of firmware
-#define HTTP_OTA_VERSION       String(__FILE__).substring(String(__FILE__).lastIndexOf('/')+1) + ".001"
+#define HTTP_OTA_VERSION       String(__FILE__).substring(String(__FILE__).lastIndexOf('/')+1) + "." + version
 
 #endif
 
@@ -397,27 +399,37 @@ void loop() {
  * D_OUT MISO     GPIO12  (D6)  6       HSPI-q
  * D_IN  MOSI     GPIO13  (D7)  7       HSPI-d
  * CS    SS       GPIO15  (D8)  16      HSPI-cs
+ * =============  ======  ====  ======  ========
+ * MCP2515 INT    GPIO04  (D2)  19      I/O
+ * =============  ======  ====  ======  ========
  * 
- * We use D2 as the INTPIN. It is more usual to use D4 for that, bus as the WeMos has
+ * We use D2 as the INTPIN. It is more common to use D4 for that, bus as the WeMos has
  * the LED wired there, we want to keep that one unused
  * 
  * As we use a cheap controller card using the TJA1050 CANbus tranceiver, we need
  * to make a small modification to allow the MCP2515 to run on 3.3 volt and
  * the TJA1050 on 5 volt, see https://www.raspberrypi.org/forums/viewtopic.php?f=44&t=141052
  * 
+ * We use the mcp_can library, fork by Cory Fowler
+ * https://github.com/coryjfowler/MCP_CAN_lib
+ * 
  */
 
 ESP8266WebServer server(80);            
 
-// https://github.com/coryjfowler/MCP_CAN_lib
+#define LEDPIN          LED_BUILTIN     // LED pin
+
+/******************************************
+    MCP2515 declarations
+ ******************************************/
 #include <mcp_can.h>
 #include <SPI.h>
 MCP_CAN CAN0(D8);                       // Set CS to D8 on Wemos
-
-#define LEDPIN          LED_BUILTIN     // LED pin
 #define INTPIN          D2              // INT pin of MCP2515
 
-// communication globals
+/******************************************
+    Communication globals
+ ******************************************/
 String  lastInitProblem;
 byte    idIndex [0x700];                // index in Qbuf, for ID's 0x000 - 0x6ff
 byte    Qbuf [900];                     // room for 100 different free frames, 8 bytes data plus length
@@ -440,11 +452,18 @@ void initHttp () {
 
   server.on("/", handleRoot);
 
-  server.on("/Init", handleInitDevice);
-  server.on("/IsoTp", handleIsoTpFrame);
-  server.on("/Free", handleFreeFrame);
-  server.on("/Raw", handleRawFrame);
-  server.on("/Config", handleConfig);
+  server.on("/Init",        handleInitDevice);
+  server.on("/Init.php",    handleInitDevice);
+  server.on("/IsoTp",       handleIsoTpFrame);
+  server.on("/IsoTp.php",   handleIsoTpFrame);
+  server.on("/Free",        handleFreeFrame);
+  server.on("/Free.php",    handleFreeFrame);
+  server.on("/Raw",         handleRawFrame);
+  server.on("/Raw.php",     handleRawFrame);
+  server.on("/Config",      handleConfig);
+  server.on("/Config.php",  handleConfig);
+  server.on("/Version",     handleVersion);
+  server.on("/Version.php", handleVersion);
   server.onNotFound(handleRoot);
 
   server.begin();
@@ -487,6 +506,12 @@ void handleRawFrame () {
 }
 
 void handleConfig() {
+  server.send(200, "application/json", "{\"C\":\"Config\",\"R\":\"Depreciated\"}");
+}
+
+void handleVersion() {
+  String v = CODE_VERSION;
+  server.send(200, "application/json", "{\"C\":\"Version\",\"R\":\"" + v + "\"}");
 }
 
 
@@ -497,7 +522,7 @@ void handleConfig() {
 boolean initDevice(int toughness) {
   pinMode(INTPIN, INPUT);
 
-  if (CAN0.begin(MCP_STD, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
+  if (CAN0.begin(MCP_STDEXT, CAN_500KBPS, MCP_8MHZ) != CAN_OK) {
     lastInitProblem = "Error Initializing MCP2515";
     return false;
   }
@@ -554,7 +579,7 @@ boolean sendRawCommand (INT32U id, String command) {
   int i;
   
   if (len > 8) return false;              // raw is of course single frame
-  for (len = 0; i < len; i++) {           // fill the buffer
+  for (i = 0; i < len; i++) {           // fill the buffer
     sendBuffer [i] = (byte)strtol(command.substring(i * 2, i * 2 + 2).c_str(), NULL, 16);
   }
                                           // send the buffer
@@ -700,7 +725,7 @@ String requestIsoTpFrame(String frame) {
   token = strtok (NULL, ".");
   String responseId = String (token);     // command response 6121
   String requestId = String (token);
-  requestId.setCharAt (0, requestId.charAt(0) - 4); // command 2121
+  requestId.setCharAt (0, requestId.charAt(0) & 0xbf); // command 2121
 
   // Avoid overloading the processor or the MCP or the SPI bus by filtering
   // just diagnostics. this could in fact be reduced to only the requested
